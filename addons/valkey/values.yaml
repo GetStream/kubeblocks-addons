@@ -1,0 +1,57 @@
+# Default values for the valkey addon.
+# Single Valkey major version (9.x); add new entries here when adopting newer
+# patch / minor versions. Cluster topology only — no sentinel, no twemproxy.
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Valkey versions: each entry produces a release line in ComponentVersion.
+# `serviceVersion` is what users select in their Cluster CR; `imageTag` is
+# the docker.io/valkey/valkey tag. Add a new entry to support a new patch
+# without changing existing clusters.
+valkeyVersions:
+  - major: "9"
+    componentDef: "valkey-cluster-9"
+    serviceVersion: "9.0.3"
+    defaultImageTag: "9.0.3"
+    mirrorVersions:
+      - version: "9.0.3"
+        imageTag: "9.0.3"
+      - version: "9.1.0"
+        imageTag: "9.1.0"
+
+image:
+  registry: docker.io
+  repository: valkey/valkey
+  pullPolicy: IfNotPresent
+
+# dbctl + agamotto stay on apecloud images — they are KubeBlocks-side
+# tooling, not the engine.
+dbctlImage:
+  registry: ""
+  repository: apecloud/dbctl
+  pullPolicy: IfNotPresent
+  tag: 0.2.1
+
+metrics:
+  image:
+    registry: ""
+    repository: oliver006/redis_exporter
+    tag: v1.80.1
+    pullPolicy: IfNotPresent
+  service:
+    port: 9121
+    serverPort: 8888
+
+# defined the data volume mount path of valkey server
+dataMountPath: /data
+
+logConfigs:
+  running: /data/running.log
+
+# cluster domain without . prefix
+clusterDomain: "cluster.local"
+
+enableMetrics: true
+
+tlsMountPath: /etc/pki/tls

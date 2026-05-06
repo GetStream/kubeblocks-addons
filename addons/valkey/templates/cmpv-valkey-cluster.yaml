@@ -1,0 +1,36 @@
+apiVersion: apps.kubeblocks.io/v1
+kind: ComponentVersion
+metadata:
+  name: valkey-cluster
+  labels:
+    {{- include "valkey.labels" . | nindent 4 }}
+  annotations:
+    {{- include "valkey.apiVersion" . | nindent 4 }}
+spec:
+  compatibilityRules:
+  {{- range .Values.valkeyVersions }}
+  - compDefs:
+      - {{ .componentDef }}
+    releases:
+    {{- range .mirrorVersions }}
+    - {{ .version }}
+    {{- end }}
+  {{- end }}
+  releases:
+  {{- $valkeyRepository := printf "%s/%s" ( .Values.image.registry | default "docker.io" ) .Values.image.repository }}
+  {{- range .Values.valkeyVersions }}
+  {{- range .mirrorVersions }}
+  - name: {{ .version }}
+    serviceVersion: {{ .version }}
+    images:
+      valkey-cluster: {{ $valkeyRepository }}:{{ .imageTag }}
+      postProvision: {{ $valkeyRepository }}:{{ .imageTag }}
+      accountProvision: {{ $valkeyRepository }}:{{ .imageTag }}
+      switchover: {{ $valkeyRepository }}:{{ .imageTag }}
+      preTerminate: {{ $valkeyRepository }}:{{ .imageTag }}
+      memberLeave: {{ $valkeyRepository }}:{{ .imageTag }}
+      memberJoin: {{ $valkeyRepository }}:{{ .imageTag }}
+      metrics: {{ include "metrics.repository" $ }}:{{ $.Values.metrics.image.tag }}
+      init-dbctl: {{ $.Values.dbctlImage.registry | default ( $.Values.image.registry | default "docker.io" ) }}/{{ $.Values.dbctlImage.repository }}:{{ $.Values.dbctlImage.tag }}
+  {{- end }}
+  {{- end }}
