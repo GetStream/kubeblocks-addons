@@ -6,7 +6,7 @@ type: application
 
 version: 0.1.0
 
-appVersion: "9.0.3"
+appVersion: "9.0.4"
 
 # Add a dependency to the kubeblocks definition library chart, same as the redis addon.
 dependencies:
