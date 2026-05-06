@@ -615,7 +615,7 @@ Describe "Redis Cluster Manage Bash Script Tests"
 
   Describe "initialize_redis_cluster()"
 
-    Context "when failed to get primary nodes or primary nodes count is less than 3"
+    Context "when failed to get primary nodes"
       gen_initialize_redis_cluster_primary_node() {
         declare -gA initialize_redis_cluster_primary_nodes
       }
@@ -630,10 +630,10 @@ Describe "Redis Cluster Manage Bash Script Tests"
       }
       After "un_setup"
 
-      It "exits with error when failed to get primary nodes or primary nodes count is less than 3"
+      It "exits with error when no primary nodes are discovered"
         When run initialize_redis_cluster
         The status should be failure
-        The stderr should include "Failed to get primary nodes or the primary nodes count is less than 3"
+        The stderr should include "Failed to get primary nodes"
       End
     End
 

@@ -10,7 +10,7 @@ spec:
   template:
     compDef: {{ include "redisCluster.cmpdRegexpPattern" . }}
   shardsLimit:
-    minShards: 3
+    minShards: 1
     maxShards: 64
   provisionStrategy: Parallel
   updateStrategy: Parallel

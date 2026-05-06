@@ -298,6 +298,60 @@ Describe "Redis Cluster Common Bash Script Tests"
     End
   End
 
+  Describe "build_single_shard_addslots_command()"
+    Context "on Redis 7+ without password"
+      It "uses CLUSTER ADDSLOTSRANGE"
+        node_endpoint="172.0.0.1:6379"
+
+        When call build_single_shard_addslots_command "$node_endpoint"
+        The output should eq "redis-cli  -h 172.0.0.1 -p 6379  cluster addslotsrange 0 16383"
+        The stderr should include "initialize single-shard cluster command: redis-cli  -h 172.0.0.1 -p 6379  cluster addslotsrange 0 16383"
+      End
+    End
+
+    Context "on Redis 7+ with password"
+      setup() {
+        export REDIS_DEFAULT_PASSWORD="password"
+      }
+      Before "setup"
+
+      un_setup() {
+        unset REDIS_DEFAULT_PASSWORD
+      }
+      After "un_setup"
+
+      It "masks password in log and forwards via -a"
+        node_endpoint="172.0.0.1:6379"
+
+        When call build_single_shard_addslots_command "$node_endpoint"
+        The output should eq "redis-cli  -h 172.0.0.1 -p 6379 -a password cluster addslotsrange 0 16383"
+        The stderr should include "initialize single-shard cluster command: redis-cli  -h 172.0.0.1 -p 6379 -a ******** cluster addslotsrange 0 16383"
+      End
+    End
+
+    Context "on Redis 6 (LEGACY_REDIS=true)"
+      setup() {
+        export LEGACY_REDIS="true"
+      }
+      Before "setup"
+
+      un_setup() {
+        unset LEGACY_REDIS
+      }
+      After "un_setup"
+
+      It "falls back to CLUSTER ADDSLOTS with all slots enumerated"
+        node_endpoint="172.0.0.1:6379"
+
+        When call build_single_shard_addslots_command "$node_endpoint"
+        The output should include "redis-cli  -h 172.0.0.1 -p 6379  cluster addslots 0 1 2"
+        The output should include "16381 16382 16383"
+        The output should not include "addslotsrange"
+        The stderr should include "initialize single-shard cluster command:"
+      End
+    End
+  End
+
   Describe "build_secondary_replicated_command()"
     Context "when REDIS_DEFAULT_PASSWORD is not set"
       It "builds secondary replicated command without password"

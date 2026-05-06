@@ -630,8 +630,8 @@ initialize_redis_cluster() {
   gen_initialize_redis_cluster_primary_node
   gen_initialize_redis_cluster_secondary_nodes
 
-  if [ ${#initialize_redis_cluster_primary_nodes[@]} -eq 0 ] || [ ${#initialize_redis_cluster_primary_nodes[@]} -lt 3 ]; then
-    echo "Failed to get primary nodes or the primary nodes count is less than 3" >&2
+  if [ ${#initialize_redis_cluster_primary_nodes[@]} -eq 0 ]; then
+    echo "Failed to get primary nodes" >&2
     return 1
   fi
 

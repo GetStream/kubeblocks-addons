@@ -459,6 +459,37 @@ build_redis_cluster_create_command() {
   echo "$initialize_command"
 }
 
+# `redis-cli --cluster create` rejects clusters with fewer than 3 masters.
+# For single-shard provisioning we bypass it and assign all 16384 slots to
+# the lone primary directly, mirroring how managed services (e.g. AWS
+# ElastiCache) support 1-node Valkey/Redis Cluster topologies.
+build_single_shard_addslots_command() {
+  local node_endpoint="$1"
+  local host="${node_endpoint%:*}"
+  local port="${node_endpoint##*:}"
+  unset_xtrace_when_ut_mode_false
+  local auth=""
+  if ! is_empty "$REDIS_DEFAULT_PASSWORD"; then
+    auth="-a $REDIS_DEFAULT_PASSWORD"
+  fi
+  if [ "$LEGACY_REDIS" == "true" ]; then
+    # Redis 6 lacks CLUSTER ADDSLOTSRANGE; pass all 16384 slots in a single call.
+    local slots
+    slots=$(seq 0 16383 | tr '\n' ' ')
+    initialize_command="redis-cli $REDIS_CLI_TLS_CMD -h $host -p $port $auth cluster addslots ${slots% }"
+  else
+    initialize_command="redis-cli $REDIS_CLI_TLS_CMD -h $host -p $port $auth cluster addslotsrange 0 16383"
+  fi
+  if is_empty "$REDIS_DEFAULT_PASSWORD"; then
+    logging_mask_initialize_command="$initialize_command"
+  else
+    logging_mask_initialize_command="${initialize_command/$REDIS_DEFAULT_PASSWORD/********}"
+  fi
+  echo "initialize single-shard cluster command: $logging_mask_initialize_command" >&2
+  set_xtrace_when_ut_mode_false
+  echo "$initialize_command"
+}
+
 build_secondary_replicated_command() {
   local secondary_endpoint_with_port="$1"
   local mapping_primary_endpoint_with_port="$2"
@@ -565,7 +596,14 @@ build_acl_save_command() {
 
 create_redis_cluster() {
   local primary_nodes="$1"
-  initialize_command=$(build_redis_cluster_create_command "$primary_nodes")
+  local primary_count
+  primary_count=$(echo "$primary_nodes" | wc -w | tr -d ' ')
+  if [ "$primary_count" -eq 1 ]; then
+    local single_node="${primary_nodes% }"
+    initialize_command=$(build_single_shard_addslots_command "$single_node")
+  else
+    initialize_command=$(build_redis_cluster_create_command "$primary_nodes")
+  fi
   if ! $initialize_command; then
     echo "Failed to create Redis Cluster" >&2
     return 1
