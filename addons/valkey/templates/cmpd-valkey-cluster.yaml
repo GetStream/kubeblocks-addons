@@ -76,7 +76,15 @@ spec:
       namespace: {{ $.Release.Namespace }}
       volumeName: valkey-cluster-config
       externalManaged: true
-      {{- include "valkey.config.reconfigureAction" $ | nindent 6 }}
+      # NOTE: dropped the `reconfigure` field (helper:
+      # valkey.config.reconfigureAction) because the field was added to the
+      # ComponentDefinition CRD in KubeBlocks 1.1.x and is not in 1.0.2 (current
+      # stable). When upgrading the operator past 1.1.x, re-add:
+      #     {{ "{{- include \"valkey.config.reconfigureAction\" $ | nindent 6 }}" }}
+      # Trade-off: without `reconfigure`, ConfigMap changes don't hot-reload via
+      # operator exec. Config changes take effect on the next pod restart (helm
+      # upgrade with resource/version delta, or `kubectl create -f
+      # charts/valkey/ops/restart.yaml`). Adequate for our cache-mode workload.
   scripts:
     - name: valkey-cluster-scripts
       template: {{ include "valkeyCluster.scriptsTemplate" $ }}
