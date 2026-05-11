@@ -12,18 +12,16 @@ spec:
   shardsLimit:
     minShards: 1
     maxShards: 64
-  # provisionStrategy: how shards are added during initial cluster create or
-  # scale-out. Parallel is safe here — the bootstrap script ensures all shards
-  # converge before slot assignment runs.
+  # NOTE: provisionStrategy + updateStrategy are declared/validated by KB 1.0.2
+  # (`controllers/apps/shardingdefinition_controller.go:validateProvisionNUpdateStrategy`)
+  # but NOT actually consumed when reconciling shard rollouts. The cluster
+  # controller updates all sharding components in parallel regardless of this
+  # value. Verified by `grep -r SerialStrategy pkg/controller/` returning no
+  # consumer references. Leaving as Parallel to match the field's actual
+  # semantics in this KB version — see charts/valkey/README.md for what
+  # actually controls upgrade safety (spoiler: nothing, currently).
   provisionStrategy: Parallel
-  # updateStrategy: how shards are processed during Upgrade/Restart/VScale
-  # OpsRequests. MUST be Serial for a Redis Cluster: if multiple shards roll
-  # in parallel, you can simultaneously lose every replica (then every
-  # primary), which breaks cluster bus quorum and leaves orphan/ghost nodes
-  # the heal CronJob can't recover from (no anchor pod in cluster_state:ok).
-  # Within a shard, podManagementPolicy=OrderedReady on the cmpd already
-  # serializes replica → primary with CLUSTER FAILOVER in between.
-  updateStrategy: Serial
+  updateStrategy: Parallel
   systemAccounts:
     - name: default
       shared: true
