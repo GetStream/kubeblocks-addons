@@ -12,8 +12,18 @@ spec:
   shardsLimit:
     minShards: 1
     maxShards: 64
+  # provisionStrategy: how shards are added during initial cluster create or
+  # scale-out. Parallel is safe here — the bootstrap script ensures all shards
+  # converge before slot assignment runs.
   provisionStrategy: Parallel
-  updateStrategy: Parallel
+  # updateStrategy: how shards are processed during Upgrade/Restart/VScale
+  # OpsRequests. MUST be Serial for a Redis Cluster: if multiple shards roll
+  # in parallel, you can simultaneously lose every replica (then every
+  # primary), which breaks cluster bus quorum and leaves orphan/ghost nodes
+  # the heal CronJob can't recover from (no anchor pod in cluster_state:ok).
+  # Within a shard, podManagementPolicy=OrderedReady on the cmpd already
+  # serializes replica → primary with CLUSTER FAILOVER in between.
+  updateStrategy: Serial
   systemAccounts:
     - name: default
       shared: true
