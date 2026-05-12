@@ -1,4 +1,16 @@
 #!/bin/bash
+#
+# Sync ACL rules from existing shard peers onto a newly-joined pod. Invoked
+# by KubeBlocks as the memberJoin lifecycle action.
+#
+# Env vars in scope (we tolerate either naming so the script works under
+# both 1.0.x and 1.1.x KB versions):
+#   - KB_JOIN_MEMBER_POD_FQDN     — the pod being joined (injected by KB)
+#   - REDIS_POD_FQDN_LIST         — historical upstream name (often unset)
+#   - CURRENT_SHARD_POD_FQDN_LIST — name our cmpd actually exposes
+#
+# If neither list is populated, we have no peers to query and there's
+# nothing to sync. Exit 0 in that case rather than failing the join.
 
 service_port=${SERVICE_PORT:-6379}
 redis_base_cmd="redis-cli $REDIS_CLI_TLS_CMD -p $service_port -a $REDIS_DEFAULT_PASSWORD"
@@ -6,10 +18,17 @@ if [ -z "$REDIS_DEFAULT_PASSWORD" ]; then
    redis_base_cmd="redis-cli $REDIS_CLI_TLS_CMD -p $service_port"
 fi
 
+# Pick whichever peer list is populated; tolerate either name.
+peer_list="${REDIS_POD_FQDN_LIST:-$CURRENT_SHARD_POD_FQDN_LIST}"
+if [ -z "$peer_list" ]; then
+    echo "No peer FQDN list available (REDIS_POD_FQDN_LIST and CURRENT_SHARD_POD_FQDN_LIST both empty); nothing to sync, exiting 0" >&2
+    exit 0
+fi
+
 is_ok=false
 acl_list=""
 # 1. get acl list from other pods
-for pod_fqdn in $(echo "$REDIS_POD_FQDN_LIST" | tr ',' '\n'); do
+for pod_fqdn in $(echo "$peer_list" | tr ',' '\n'); do
     if [[ "$pod_fqdn" == "$KB_JOIN_MEMBER_POD_FQDN" ]]; then
         continue
     fi
@@ -21,7 +40,7 @@ for pod_fqdn in $(echo "$REDIS_POD_FQDN_LIST" | tr ',' '\n'); do
 done
 
 if [ "$is_ok" = false ]; then
-    echo "Failed to get ACL LIST from other pods" >&2
+    echo "Failed to get ACL LIST from any peer in: $peer_list" >&2
     exit 1
 fi
 
