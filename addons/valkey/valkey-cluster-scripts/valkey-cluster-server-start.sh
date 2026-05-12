@@ -352,6 +352,30 @@ remove_rebuild_instance_flag() {
   fi
 }
 
+# is_rejoining_pod returns 0 if this pod's PVC has preserved cluster state
+# from a prior incarnation — i.e. nodes.conf shows we were part of a
+# multi-node Redis cluster. When EBS persistence is enabled, this is the
+# normal case after any pod recreation (Karpenter reschedule, AMI bump,
+# machine type change, AZ failover). The right thing to do is let redis
+# start with its preserved identity and let the cluster bus gossip update
+# peer addresses; the start script should NOT try to add-node or replicate
+# this pod (which fails with "Node ... is not empty" because the pod
+# already has cluster state).
+#
+# Distinct from is_rebuild_instance, which looks for an explicit
+# /data/rebuild.flag set by KubeBlocks during a planned wipe-and-rejoin.
+# A rejoining pod has nodes.conf AND no rebuild.flag.
+is_rejoining_pod() {
+  [[ ! -f /data/nodes.conf ]] && return 1
+  # Need at least 2 lines (self + peers). A single-line nodes.conf is what
+  # a fresh redis writes on first start, before any cluster membership.
+  [[ $(grep -c ":" /data/nodes.conf) -le 1 ]] && return 1
+  # Explicit KB-driven rebuild path takes precedence — fall through to the
+  # existing add-node/replicate logic, which knows how to handle that flag.
+  [[ -f /data/rebuild.flag ]] && return 1
+  return 0
+}
+
 # scale out replica of redis cluster shard if needed
 scale_redis_cluster_replica() {
   # Waiting for redis-server to start
@@ -371,6 +395,23 @@ scale_redis_cluster_replica() {
     cat /data/nodes.conf
   else
     echo "the nodes.conf file after redis server start is not exist"
+  fi
+
+  # EBS-rejoin short-circuit: when the PVC has preserved cluster state from a
+  # prior incarnation of this pod (typical after node replacement when
+  # persistence is enabled), the right thing is to let redis start with its
+  # preserved node identity and let cluster bus gossip update peer addresses.
+  # The add-node path below would fail here with "Node ... is not empty"
+  # because the pod already has cluster state.
+  #
+  # KubeBlocks-driven rebuild (via /data/rebuild.flag) still falls through
+  # to the existing logic, which knows how to handle that case.
+  if is_rejoining_pod; then
+    nodes_count=$(grep -c ":" /data/nodes.conf)
+    echo "EBS rejoin detected: nodes.conf has ${nodes_count} entries from prior cluster membership."
+    echo "Skipping scale-out logic; redis cluster bus will re-converge via gossip."
+    echo "(FQDNs are stable across pod recreation; peers will update this pod's IP via gossip.)"
+    exit 0
   fi
 
   for target_node_name in $(echo "${CURRENT_SHARD_POD_NAME_LIST}" | tr ',' '\n'); do
