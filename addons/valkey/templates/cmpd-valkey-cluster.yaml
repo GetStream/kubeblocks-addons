@@ -473,6 +473,10 @@ spec:
           - /scripts/sync-acl.sh
         targetPodSelector: Any
   runtime:
+    # Generous grace so AOF rewrite or in-flight fsync can land before SIGKILL.
+    # Must exceed redis-conf `shutdown-timeout` (25s) by enough margin for
+    # preStop hook + clean exit.
+    terminationGracePeriodSeconds: 60
     initContainers:
       - name: init-dbctl
         command:

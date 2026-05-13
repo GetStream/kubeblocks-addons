@@ -38,10 +38,11 @@ oom-score-adj no
 oom-score-adj-values 0 200 800
 disable-thp yes
 
-# AOF off: fsync on EBS gp3 caused 30-40ms event-loop stalls (LATENCY DOCTOR
-# confirmed). Replicas + EBS-mounted nodes.conf give us cluster-topology
-# durability, which is all we need for a cache.
-appendonly no
+# AOF on: required for data preservation across image-swap restarts. Without
+# AOF, shutdown-save races with shutdown-timeout under concurrent writes, and
+# a flushed dump.rdb can wipe a shard via the "empty master returns" cluster
+# bus path. With AOF, every write is on disk within ~1s; restart replays AOF.
+appendonly yes
 appendfilename "appendonly.aof"
 appenddirname "appendonlydir"
 appendfsync everysec
@@ -52,9 +53,14 @@ aof-load-truncated yes
 aof-use-rdb-preamble yes
 aof-timestamp-enabled no
 
-# Disable scheduled BGSAVE forks (default rules tripped every ~90s under our
-# load; each fork briefly stalls the event loop).
+# No scheduled BGSAVE: AOF gives us continuous durability; periodic BGSAVE
+# forks add latency without adding safety.
 save ""
+
+# Generous shutdown budget: AOF makes the final save cheap, but during AOF
+# rewrite or under load there can still be I/O to drain. Paired with the
+# cmpd's terminationGracePeriodSeconds (must be > this value).
+shutdown-timeout 25
 
 slowlog-log-slower-than 10000
 slowlog-max-len 128
