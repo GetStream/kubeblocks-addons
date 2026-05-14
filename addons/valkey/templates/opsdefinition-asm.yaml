@@ -1,0 +1,869 @@
+# ASM (Atomic Slot Migration) OpsDefinition for Valkey 9.0+ on KubeBlocks.
+#
+# Single-OpsRequest path for sharded Valkey resharding. Owns both the
+# topology change (Cluster CR shards count) AND the slot rebalance. The
+# user creates one OpsRequest with `targetShards: N` and KB runs three
+# sequential actions:
+#
+#   1. prepare-topology — if scale-out, patch Cluster CR shards up,
+#      wait for new pods Running. No-op for scale-in.
+#   2. asm-migrate — direction-aware slot rebalance (CLUSTER MIGRATESLOTS).
+#      Runs inside an existing valkey-cluster container; no kubectl needed.
+#   3. finalize-topology — if scale-in, patch Cluster CR shards down,
+#      wait for old pods Terminated. No-op for scale-out.
+#
+# The asm-orchestrator ServiceAccount + RBAC (used by 1 and 3) is created
+# per-namespace by the stream-infra valkey chart, not by this addon — the
+# OpsDef references it by name and KB resolves it in the OpsRequest's
+# namespace.
+---
+apiVersion: operations.kubeblocks.io/v1alpha1
+kind: OpsDefinition
+metadata:
+  name: asm-reshard
+  labels:
+    {{- include "valkey.labels" . | nindent 4 }}
+  annotations:
+    {{- include "valkey.apiVersion" . | nindent 4 }}
+spec:
+  parametersSchema:
+    openAPIV3Schema:
+      properties:
+        targetShards:
+          type: integer
+          description: Desired shard count after resharding
+        clusterName:
+          type: string
+          description: Name of the Valkey Cluster CR
+      required:
+        - targetShards
+        - clusterName
+  podInfoExtractors:
+    - name: valkey-pod
+      podSelector:
+        multiPodSelectionPolicy: Any
+      env:
+        - name: CLUSTER_NAMESPACE
+          valueFrom:
+            envRef:
+              envName: CLUSTER_NAMESPACE
+  actions:
+    # ── Action 1: scale-out topology change ──────────────────────────────
+    # No-op when current_shards >= target. Otherwise patches Cluster.spec.
+    # shardings[0].shards to target and waits for KubeBlocks to bring the
+    # new pods to Running.
+    - name: prepare-topology
+      failurePolicy: Fail
+      parameters:
+        - targetShards
+        - clusterName
+      workload:
+        type: Job
+        podInfoExtractorName: valkey-pod
+        backoffLimit: 0
+        podSpec:
+          # KB ignores serviceAccountName here; it injects the component's
+          # kb-managed SA. The chart binds the asm-orchestrator Role to
+          # the namespace's SA group, which covers it. See chart's
+          # templates/asm-rbac.yaml for the rationale.
+          restartPolicy: Never
+          containers:
+            - name: kubectl
+              image: {{ .Values.image.registry | default "docker.io" }}/apecloud/kubectl:1.29
+              imagePullPolicy: IfNotPresent
+              command:
+                - bash
+                - -c
+                - |
+                  set -euo pipefail
+                  CLUSTER="${clusterName}"
+                  TARGET="${targetShards}"
+                  NS="${CLUSTER_NAMESPACE}"
+                  log() { echo "[prepare-topology] $(date +%H:%M:%S) $*"; }
+
+                  CURRENT=$(kubectl get cluster -n "$NS" "$CLUSTER" \
+                    -o jsonpath='{.spec.shardings[0].shards}')
+                  log "current_shards=${CURRENT} target_shards=${TARGET}"
+
+                  if [[ "$TARGET" -le "$CURRENT" ]]; then
+                    log "Not scale-out; nothing to patch. (finalize-topology will handle scale-in.)"
+                    exit 0
+                  fi
+
+                  log "Scale-out: patching Cluster ${CLUSTER} shardings[0].shards=${TARGET}"
+                  kubectl patch cluster -n "$NS" "$CLUSTER" --type=json \
+                    -p "[{\"op\":\"replace\",\"path\":\"/spec/shardings/0/shards\",\"value\":${TARGET}}]"
+
+                  REPLICAS=$(kubectl get cluster -n "$NS" "$CLUSTER" \
+                    -o jsonpath='{.spec.shardings[0].template.replicas}')
+                  EXPECTED=$((TARGET * REPLICAS))
+                  log "Waiting for ${EXPECTED} pods Running (replicas/shard=${REPLICAS})..."
+
+                  elapsed=0
+                  while [[ $elapsed -lt 600 ]]; do
+                    READY=$(kubectl get pods -n "$NS" \
+                      -l "app.kubernetes.io/instance=${CLUSTER},apps.kubeblocks.io/sharding-name=shard" \
+                      --field-selector=status.phase=Running --no-headers 2>/dev/null \
+                      | wc -l | tr -d ' ')
+                    [[ "$READY" -ge "$EXPECTED" ]] && break
+                    [[ $((elapsed % 30)) -eq 0 ]] && log "  ready=${READY}/${EXPECTED} (${elapsed}s)..."
+                    sleep 10
+                    elapsed=$((elapsed + 10))
+                  done
+                  if [[ "$READY" -lt "$EXPECTED" ]]; then
+                    log "ERROR: only ${READY}/${EXPECTED} pods Running after 10m"
+                    exit 1
+                  fi
+
+                  log "Waiting for Cluster phase Running..."
+                  elapsed=0
+                  while [[ $elapsed -lt 300 ]]; do
+                    PHASE=$(kubectl get cluster -n "$NS" "$CLUSTER" \
+                      -o jsonpath='{.status.phase}' 2>/dev/null)
+                    [[ "$PHASE" == "Running" ]] && break
+                    sleep 5
+                    elapsed=$((elapsed + 5))
+                  done
+                  log "Cluster phase=${PHASE}. Topology ready for slot migration."
+              env:
+                - name: clusterName
+                  value: $(clusterName)
+                - name: targetShards
+                  value: $(targetShards)
+                - name: CLUSTER_NAMESPACE
+                  value: $(CLUSTER_NAMESPACE)
+
+    # ── Action 2: slot migration ─────────────────────────────────────────
+    # Direction-aware: detects scale-out vs scale-in from current vs target
+    # primary count, computes minimal slot moves, executes via CLUSTER
+    # MIGRATESLOTS. Runs inside an existing valkey-cluster container; uses
+    # CLUSTER NODES for discovery, redis-cli for the moves — no kubectl.
+    - name: asm-migrate
+      failurePolicy: Fail
+      parameters:
+        - targetShards
+        - clusterName
+      exec:
+        backoffLimit: 0
+        podInfoExtractorName: valkey-pod
+        containerName: valkey-cluster
+        command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+
+            # ── Configuration ──────────────────────────────────────────────
+            # Parameters injected by KubeBlocks via $(paramName) substitution
+            TARGET_SHARDS="$(targetShards)"
+            CLUSTER_NAME="$(clusterName)"
+            ASM_TIMEOUT="${ASM_TIMEOUT_SECONDS:-600}"
+            POLL_INTERVAL=2
+            LOCAL_PORT=6379
+
+            # ── Logging ────────────────────────────────────────────────────
+            info() { echo "[INFO]  $(date +%H:%M:%S) $*"; }
+            warn() { echo "[WARN]  $(date +%H:%M:%S) $*"; }
+            fail() { echo "[FAIL]  $(date +%H:%M:%S) $*"; }
+
+            # ── Auth ───────────────────────────────────────────────────────
+            AUTH_ARGS=""
+            if [[ -n "${REDIS_DEFAULT_PASSWORD:-}" ]]; then
+              AUTH_ARGS="--no-auth-warning -a ${REDIS_DEFAULT_PASSWORD}"
+            fi
+
+            vcli() {
+              local host="$1" port="$2"; shift 2
+              if command -v valkey-cli >/dev/null 2>&1; then
+                valkey-cli $AUTH_ARGS -h "$host" -p "$port" "$@"
+              else
+                redis-cli $AUTH_ARGS -h "$host" -p "$port" "$@"
+              fi
+            }
+
+            vcli_local() {
+              vcli 127.0.0.1 "$LOCAL_PORT" "$@"
+            }
+
+            # ── Step 1: Validate parameters ────────────────────────────────
+            if [[ -z "$TARGET_SHARDS" ]]; then
+              fail "TARGET_SHARDS is not set. Pass it via OpsRequest parameters."
+              exit 1
+            fi
+            if ! [[ "$TARGET_SHARDS" =~ ^[0-9]+$ ]] || [[ "$TARGET_SHARDS" -lt 1 ]]; then
+              fail "TARGET_SHARDS must be a positive integer, got: '${TARGET_SHARDS}'"
+              exit 1
+            fi
+            if [[ -z "$CLUSTER_NAME" ]]; then
+              fail "CLUSTER_NAME is not set. Pass it via OpsRequest parameters."
+              exit 1
+            fi
+
+            info "ASM resharding: cluster=${CLUSTER_NAME} target_shards=${TARGET_SHARDS} timeout=${ASM_TIMEOUT}s"
+
+            # ── Step 2: Discover topology ──────────────────────────────────
+            CLUSTER_NODES_RAW="$(vcli_local CLUSTER NODES)"
+            if [[ -z "$CLUSTER_NODES_RAW" ]]; then
+              fail "CLUSTER NODES returned empty. Is the cluster running?"
+              exit 1
+            fi
+
+            declare -a PRIMARY_IDS=() PRIMARY_HOSTS=() PRIMARY_PORTS=() PRIMARY_SLOTS=() PRIMARY_COMP=()
+
+            while IFS= read -r line; do
+              [[ -z "$line" ]] && continue
+              local_id="$(echo "$line" | awk '{print $1}')"
+              local_addr="$(echo "$line" | awk '{print $2}' | cut -d@ -f1)"
+              local_flags="$(echo "$line" | awk '{print $3}')"
+              local_host="$(echo "$local_addr" | rev | cut -d: -f2- | rev)"
+              local_port="$(echo "$local_addr" | rev | cut -d: -f1 | rev)"
+              if echo "$local_flags" | grep -q "master" && ! echo "$local_flags" | grep -q "fail\|handshake"; then
+                PRIMARY_IDS+=("$local_id")
+                PRIMARY_HOSTS+=("$local_host")
+                PRIMARY_PORTS+=("$local_port")
+                local_slots="$(echo "$line" | awk '{for(i=9;i<=NF;i++) printf "%s ", $i}')"
+                PRIMARY_SLOTS+=("$local_slots")
+                # Extract component short name from FQDN in CLUSTER NODES addr field.
+                # Format: ip:port@cport,podname.headless.ns.svc...
+                # Pod name: {cluster}-{comp}-{ordinal} -> component = {comp}
+                local_fqdn="$(echo "$line" | awk '{print $2}' | cut -d@ -f2 | cut -d, -f2 | cut -d. -f1)"
+                # Strip pod ordinal: valkey-poc-shard-mk4-0 -> valkey-poc-shard-mk4
+                local_pod_base="${local_fqdn%-*}"
+                # Strip cluster prefix: valkey-poc-shard-mk4 -> shard-mk4
+                local_comp="${local_pod_base#${CLUSTER_NAME}-}"
+                PRIMARY_COMP+=("$local_comp")
+              fi
+            done <<< "$CLUSTER_NODES_RAW"
+
+            CURRENT_SHARDS="${#PRIMARY_IDS[@]}"
+
+            # Sort primaries by component short name (ascending) to match KubeBlocks'
+            # shard removal rule: alphabetical sort, keep first N, drop the rest.
+            # This ensures indices >= TARGET_SHARDS correspond to the shards KB will remove.
+            if [[ $CURRENT_SHARDS -gt 1 ]]; then
+              # Build sortable lines: "comp_name|index", sort by comp_name, extract reordered indices
+              declare -a SORT_ORDER=()
+              for i in "${!PRIMARY_COMP[@]}"; do
+                echo "${PRIMARY_COMP[$i]}|$i"
+              done | sort -t'|' -k1,1 | while IFS='|' read -r _ idx; do
+                SORT_ORDER+=("$idx")
+              done
+              # If subshell ate SORT_ORDER, rebuild via temp file
+              if [[ ${#SORT_ORDER[@]} -eq 0 ]]; then
+                SORT_TMP="$(mktemp)"
+                for i in "${!PRIMARY_COMP[@]}"; do
+                  echo "${PRIMARY_COMP[$i]}|$i"
+                done | sort -t'|' -k1,1 | cut -d'|' -f2 > "$SORT_TMP"
+                SORT_ORDER=()
+                while IFS= read -r idx; do
+                  SORT_ORDER+=("$idx")
+                done < "$SORT_TMP"
+                rm -f "$SORT_TMP"
+              fi
+              # Reorder all arrays
+              declare -a _IDS=() _HOSTS=() _PORTS=() _SLOTS=() _COMP=()
+              for idx in "${SORT_ORDER[@]}"; do
+                _IDS+=("${PRIMARY_IDS[$idx]}")
+                _HOSTS+=("${PRIMARY_HOSTS[$idx]}")
+                _PORTS+=("${PRIMARY_PORTS[$idx]}")
+                _SLOTS+=("${PRIMARY_SLOTS[$idx]}")
+                _COMP+=("${PRIMARY_COMP[$idx]}")
+              done
+              PRIMARY_IDS=("${_IDS[@]}")
+              PRIMARY_HOSTS=("${_HOSTS[@]}")
+              PRIMARY_PORTS=("${_PORTS[@]}")
+              PRIMARY_SLOTS=("${_SLOTS[@]}")
+              PRIMARY_COMP=("${_COMP[@]}")
+            fi
+
+            # Count primaries that currently own slots vs. primaries that are empty.
+            # LOADED_SHARDS is the number of slot-owning shards, which is what we
+            # actually care about for direction detection (NOT CURRENT_SHARDS, which
+            # includes freshly-created empty primaries after a Cluster CR patch).
+            LOADED_SHARDS=0
+            EMPTY_COUNT=0
+            for i in "${!PRIMARY_IDS[@]}"; do
+              slots_trimmed="$(echo "${PRIMARY_SLOTS[$i]}" | xargs)"
+              if [[ -z "$slots_trimmed" ]]; then
+                EMPTY_COUNT=$((EMPTY_COUNT + 1))
+              else
+                LOADED_SHARDS=$((LOADED_SHARDS + 1))
+              fi
+            done
+
+            info "Current topology: ${CURRENT_SHARDS} primaries (${LOADED_SHARDS} loaded, ${EMPTY_COUNT} empty), sorted by component name"
+
+            for i in "${!PRIMARY_IDS[@]}"; do
+              info "  shard ${i}: comp=${PRIMARY_COMP[$i]} id=${PRIMARY_IDS[$i]:0:8}... host=${PRIMARY_HOSTS[$i]}:${PRIMARY_PORTS[$i]} slots=[${PRIMARY_SLOTS[$i]}]"
+            done
+
+            # Nothing to do only if both the primary count matches AND all primaries
+            # own slots (no empty primaries waiting to be populated).
+            if [[ "$TARGET_SHARDS" -eq "$LOADED_SHARDS" && "$EMPTY_COUNT" -eq 0 ]]; then
+              info "Already at ${TARGET_SHARDS} loaded shards with no empty primaries. Nothing to do."
+              exit 0
+            fi
+
+            if [[ "$TARGET_SHARDS" -gt "$LOADED_SHARDS" ]]; then
+              DIRECTION="scale-out"
+              info "Direction: scale-out (${LOADED_SHARDS} loaded -> ${TARGET_SHARDS} target)"
+              if [[ $EMPTY_COUNT -eq 0 ]]; then
+                fail "No empty shards found. Ensure new shard pods joined via CLUSTER MEET."
+                exit 1
+              fi
+              if [[ $((LOADED_SHARDS + EMPTY_COUNT)) -lt "$TARGET_SHARDS" ]]; then
+                fail "Not enough primaries (${CURRENT_SHARDS}) to reach target ${TARGET_SHARDS}. Ensure Cluster CR shards=${TARGET_SHARDS} and all pods are Running."
+                exit 1
+              fi
+              info "Will migrate slots into ${EMPTY_COUNT} empty shard(s)"
+            else
+              DIRECTION="scale-in"
+              info "Direction: scale-in (${LOADED_SHARDS} loaded -> ${TARGET_SHARDS} target)"
+            fi
+
+            # ── Step 3: ACL patch ──────────────────────────────────────────
+            # MIGRATESLOTS authenticates to the target node as kbreplicator (via
+            # masterauth). The snapshot transfer replays the full RDB stream including
+            # SELECT, SET, HSET, and every other write command stored in the migrating
+            # slots. kbreplicator's default ACL (-@all +psync +replconf +ping) is far
+            # too restrictive. Grant +@all for the migration; the user is internal to
+            # the cluster (masterauth-only), so this does not widen the attack surface.
+            info "Patching ACL: granting kbreplicator +@all on all nodes for slot migration..."
+            ALL_NODES_RAW="$(vcli_local CLUSTER NODES)"
+            ACL_FAIL=0
+            while IFS= read -r line; do
+              [[ -z "$line" ]] && continue
+              node_addr="$(echo "$line" | awk '{print $2}' | cut -d@ -f1)"
+              node_flags="$(echo "$line" | awk '{print $3}')"
+              node_host="$(echo "$node_addr" | rev | cut -d: -f2- | rev)"
+              node_port="$(echo "$node_addr" | rev | cut -d: -f1 | rev)"
+              if echo "$node_flags" | grep -q "fail\|handshake"; then continue; fi
+              result="$(vcli "$node_host" "$node_port" ACL SETUSER kbreplicator "+@all" "~*" "&*" 2>&1 || echo 'ERROR')"
+              if [[ "$result" == *"OK"* ]]; then
+                info "  ACL patched: ${node_host}:${node_port}"
+              elif [[ "$result" == *"ERR"*"user"*"not"* ]] || [[ "$result" == *"ERR"*"User"*"not"* ]]; then
+                warn "  kbreplicator not found on ${node_host}:${node_port}"
+              else
+                warn "  ACL patch failed on ${node_host}:${node_port}: ${result}"
+                ACL_FAIL=$((ACL_FAIL + 1))
+              fi
+            done <<< "$ALL_NODES_RAW"
+            if [[ $ACL_FAIL -gt 0 ]]; then
+              warn "ACL patch failed on ${ACL_FAIL} node(s)."
+            fi
+
+            # ── Step 4: Check for stuck migrations ─────────────────────────
+            info "Checking for stuck migrations from previous failures..."
+            STUCK_FOUND=false
+            while IFS= read -r line; do
+              [[ -z "$line" ]] && continue
+              node_flags="$(echo "$line" | awk '{print $3}')"
+              if echo "$node_flags" | grep -q "fail\|handshake"; then continue; fi
+              slot_fields="$(echo "$line" | awk '{for(i=9;i<=NF;i++) printf "%s ", $i}')"
+              if echo "$slot_fields" | grep -qE '\[.*->-\]|\[.*-<-\]'; then
+                STUCK_FOUND=true
+                break
+              fi
+            done <<< "$ALL_NODES_RAW"
+
+            if [[ "$STUCK_FOUND" == "true" ]]; then
+              warn "Stuck MIGRATING/IMPORTING slots detected. Running cluster fix..."
+              fix_endpoint="127.0.0.1:${LOCAL_PORT}"
+              if command -v valkey-cli >/dev/null 2>&1; then
+                valkey-cli $AUTH_ARGS --cluster fix "$fix_endpoint" <<< "yes" 2>&1 || true
+              else
+                redis-cli $AUTH_ARGS --cluster fix "$fix_endpoint" <<< "yes" 2>&1 || true
+              fi
+              info "Cluster fix completed. Re-reading topology..."
+              CLUSTER_NODES_RAW="$(vcli_local CLUSTER NODES)"
+              PRIMARY_IDS=() PRIMARY_HOSTS=() PRIMARY_PORTS=() PRIMARY_SLOTS=()
+              NEW_SHARD_IDS=() NEW_SHARD_HOSTS=() NEW_SHARD_PORTS=()
+              while IFS= read -r line; do
+                [[ -z "$line" ]] && continue
+                local_id="$(echo "$line" | awk '{print $1}')"
+                local_addr="$(echo "$line" | awk '{print $2}' | cut -d@ -f1)"
+                local_flags="$(echo "$line" | awk '{print $3}')"
+                local_host="$(echo "$local_addr" | rev | cut -d: -f2- | rev)"
+                local_port="$(echo "$local_addr" | rev | cut -d: -f1 | rev)"
+                if echo "$local_flags" | grep -q "master" && ! echo "$local_flags" | grep -q "fail\|handshake"; then
+                  PRIMARY_IDS+=("$local_id")
+                  PRIMARY_HOSTS+=("$local_host")
+                  PRIMARY_PORTS+=("$local_port")
+                  local_slots="$(echo "$line" | awk '{for(i=9;i<=NF;i++) printf "%s ", $i}')"
+                  PRIMARY_SLOTS+=("$local_slots")
+                fi
+              done <<< "$CLUSTER_NODES_RAW"
+              for i in "${!PRIMARY_IDS[@]}"; do
+                slots_trimmed="$(echo "${PRIMARY_SLOTS[$i]}" | xargs)"
+                if [[ -z "$slots_trimmed" ]]; then
+                  NEW_SHARD_IDS+=("${PRIMARY_IDS[$i]}")
+                  NEW_SHARD_HOSTS+=("${PRIMARY_HOSTS[$i]}")
+                  NEW_SHARD_PORTS+=("${PRIMARY_PORTS[$i]}")
+                fi
+              done
+              CURRENT_SHARDS="${#PRIMARY_IDS[@]}"
+              info "Topology after fix: ${CURRENT_SHARDS} primaries, ${#NEW_SHARD_IDS[@]} empty"
+            fi
+
+            # ── Step 5: Compute slot plan ──────────────────────────────────
+            # Generalized: works for both scale-out and scale-in.
+            # Compute target slot count per primary, then pair donors with receivers.
+            TOTAL_SLOTS=16384
+            SLOTS_PER_SHARD=$((TOTAL_SLOTS / TARGET_SHARDS))
+            REMAINDER=$((TOTAL_SLOTS % TARGET_SHARDS))
+
+            info "Target distribution: ${SLOTS_PER_SHARD} slots/shard (+1 for first ${REMAINDER} shards)"
+
+            # Count current slots per primary
+            declare -a OWNED_SLOTS=()
+            for i in "${!PRIMARY_IDS[@]}"; do
+              count=0
+              for range in ${PRIMARY_SLOTS[$i]}; do
+                [[ "$range" == *"["* ]] && continue
+                if [[ "$range" == *"-"* ]]; then
+                  s="${range%-*}"; e="${range#*-}"
+                  count=$((count + e - s + 1))
+                elif [[ "$range" =~ ^[0-9]+$ ]]; then
+                  count=$((count + 1))
+                fi
+              done
+              OWNED_SLOTS+=("$count")
+            done
+
+            info "Current slot distribution:"
+            for i in "${!PRIMARY_IDS[@]}"; do
+              info "  shard ${i} (${PRIMARY_IDS[$i]:0:8}...): ${OWNED_SLOTS[$i]} slots"
+            done
+
+            # Compute target count per primary:
+            #   indices 0..TARGET_SHARDS-1: even share
+            #   indices TARGET_SHARDS..CURRENT_SHARDS-1: 0 (being drained on scale-in)
+            declare -a TARGET_COUNTS=()
+            for i in "${!PRIMARY_IDS[@]}"; do
+              if [[ $i -lt $TARGET_SHARDS ]]; then
+                if [[ $i -lt $REMAINDER ]]; then
+                  TARGET_COUNTS+=($((SLOTS_PER_SHARD + 1)))
+                else
+                  TARGET_COUNTS+=("$SLOTS_PER_SHARD")
+                fi
+              else
+                TARGET_COUNTS+=(0)
+              fi
+            done
+
+            # Compute delta per primary: positive = donate, negative = receive
+            declare -a DELTAS=()
+            for i in "${!PRIMARY_IDS[@]}"; do
+              DELTAS+=($((OWNED_SLOTS[$i] - TARGET_COUNTS[$i])))
+            done
+
+            info "Slot movement plan:"
+            for i in "${!PRIMARY_IDS[@]}"; do
+              d="${DELTAS[$i]}"
+              if [[ $d -gt 0 ]]; then
+                info "  shard ${i}: donate ${d} slots (${OWNED_SLOTS[$i]} -> ${TARGET_COUNTS[$i]})"
+              elif [[ $d -lt 0 ]]; then
+                info "  shard ${i}: receive $((-d)) slots (${OWNED_SLOTS[$i]} -> ${TARGET_COUNTS[$i]})"
+              fi
+            done
+
+            # Build receiver list: shards that need more slots, with remaining capacity
+            declare -a RECV_IDX=() RECV_REMAINING=()
+            for i in "${!PRIMARY_IDS[@]}"; do
+              if [[ "${DELTAS[$i]}" -lt 0 ]]; then
+                RECV_IDX+=("$i")
+                RECV_REMAINING+=($(( -${DELTAS[$i]} )))
+              fi
+            done
+
+            # Build migration tuples: pair donors with receivers.
+            # Consumes from the end of each donor's ranges, splitting across
+            # receivers as needed. Tracks a cursor (cur_end) within each range
+            # to avoid overlapping migrations.
+            declare -a MIG_SOURCE_IDX=() MIG_TARGET_IDX=() MIG_START=() MIG_END=()
+            recv_ptr=0
+
+            for src_idx in "${!PRIMARY_IDS[@]}"; do
+              remaining_donate="${DELTAS[$src_idx]}"
+              [[ "$remaining_donate" -le 0 ]] && continue
+
+              # Parse this shard's slot ranges
+              declare -a SRC_RANGES_START=() SRC_RANGES_END=()
+              for range in ${PRIMARY_SLOTS[$src_idx]}; do
+                [[ "$range" == *"["* ]] && continue
+                if [[ "$range" == *"-"* ]]; then
+                  SRC_RANGES_START+=("${range%-*}")
+                  SRC_RANGES_END+=("${range#*-}")
+                elif [[ "$range" =~ ^[0-9]+$ ]]; then
+                  SRC_RANGES_START+=("$range")
+                  SRC_RANGES_END+=("$range")
+                fi
+              done
+
+              # Walk ranges from the end, tracking a cursor within each range
+              range_idx=$(( ${#SRC_RANGES_START[@]} - 1 ))
+              cur_end="${SRC_RANGES_END[$range_idx]}"
+
+              while [[ $remaining_donate -gt 0 && $range_idx -ge 0 ]]; do
+                r_start="${SRC_RANGES_START[$range_idx]}"
+                r_available=$((cur_end - r_start + 1))
+
+                # Find a receiver with remaining capacity
+                while [[ $recv_ptr -lt ${#RECV_IDX[@]} ]]; do
+                  [[ "${RECV_REMAINING[$recv_ptr]}" -gt 0 ]] && break
+                  recv_ptr=$((recv_ptr + 1))
+                done
+                if [[ $recv_ptr -ge ${#RECV_IDX[@]} ]]; then
+                  warn "No more receivers for slots."; break
+                fi
+
+                # Take min(available_in_range, receiver_needs, remaining_donate)
+                recv_needs="${RECV_REMAINING[$recv_ptr]}"
+                take_size=$r_available
+                [[ $take_size -gt $recv_needs ]] && take_size=$recv_needs
+                [[ $take_size -gt $remaining_donate ]] && take_size=$remaining_donate
+
+                take_end="$cur_end"
+                take_start=$((cur_end - take_size + 1))
+
+                tgt_idx="${RECV_IDX[$recv_ptr]}"
+                MIG_SOURCE_IDX+=("$src_idx"); MIG_TARGET_IDX+=("$tgt_idx")
+                MIG_START+=("$take_start"); MIG_END+=("$take_end")
+
+                remaining_donate=$((remaining_donate - take_size))
+                RECV_REMAINING[$recv_ptr]=$((${RECV_REMAINING[$recv_ptr]} - take_size))
+                [[ "${RECV_REMAINING[$recv_ptr]}" -le 0 ]] && recv_ptr=$((recv_ptr + 1))
+
+                # Shrink the working range
+                cur_end=$((take_start - 1))
+                if [[ $cur_end -lt $r_start ]]; then
+                  # Range fully consumed, move to previous range
+                  range_idx=$((range_idx - 1))
+                  [[ $range_idx -ge 0 ]] && cur_end="${SRC_RANGES_END[$range_idx]}"
+                fi
+              done
+              unset SRC_RANGES_START SRC_RANGES_END
+            done
+
+            if [[ "${#MIG_SOURCE_IDX[@]}" -eq 0 ]]; then
+              info "No migrations needed. Cluster is already balanced."; exit 0
+            fi
+
+            info "Planned ${#MIG_SOURCE_IDX[@]} migration(s):"
+            for i in "${!MIG_SOURCE_IDX[@]}"; do
+              src="${MIG_SOURCE_IDX[$i]}"; tgt="${MIG_TARGET_IDX[$i]}"
+              info "  slots ${MIG_START[$i]}-${MIG_END[$i]} from shard ${src} (${PRIMARY_IDS[$src]:0:8}...) to shard ${tgt} (${PRIMARY_IDS[$tgt]:0:8}...)"
+            done
+
+            # ── Step 6: Execute migrations ─────────────────────────────────
+            cancel_all_migrations() {
+              warn "Cancelling all in-flight migrations..."
+              for i in "${!PRIMARY_IDS[@]}"; do
+                slots_trimmed="$(echo "${PRIMARY_SLOTS[$i]}" | xargs)"
+                [[ -z "$slots_trimmed" ]] && continue
+                vcli "${PRIMARY_HOSTS[$i]}" "${PRIMARY_PORTS[$i]}" CLUSTER CANCELSLOTMIGRATIONS 2>&1 || true
+              done
+            }
+
+            run_cluster_fix() {
+              warn "Running cluster fix as remediation..."
+              fix_endpoint="127.0.0.1:${LOCAL_PORT}"
+              if command -v valkey-cli >/dev/null 2>&1; then
+                valkey-cli $AUTH_ARGS --cluster fix "$fix_endpoint" <<< "yes" 2>&1 || true
+              else
+                redis-cli $AUTH_ARGS --cluster fix "$fix_endpoint" <<< "yes" 2>&1 || true
+              fi
+            }
+
+            # Helper: extract state for a specific slot range from GETSLOTMIGRATIONS output.
+            # GETSLOTMIGRATIONS returns entries newest-first. Return the FIRST match
+            # for the given slot_range (= most recent migration for those slots).
+            get_mig_state() {
+              local output="$1" target_range="$2"
+              local found_range="" current_state=""
+              while IFS= read -r kv_line; do
+                case "$kv_line" in
+                  slot_ranges) found_range="next" ;;
+                  state)       current_state="next" ;;
+                  *)
+                    if [[ "$found_range" == "next" ]]; then
+                      found_range="$kv_line"
+                    elif [[ "$current_state" == "next" ]]; then
+                      current_state="$kv_line"
+                      if [[ "$found_range" == "$target_range" ]]; then
+                        echo "$current_state"
+                        return 0
+                      fi
+                      found_range=""; current_state=""
+                    fi
+                    ;;
+                esac
+              done <<< "$output"
+            }
+
+            MIGRATION_FAILED=false
+            for mig_idx in "${!MIG_SOURCE_IDX[@]}"; do
+              src="${MIG_SOURCE_IDX[$mig_idx]}"; tgt="${MIG_TARGET_IDX[$mig_idx]}"
+              start="${MIG_START[$mig_idx]}"; end="${MIG_END[$mig_idx]}"
+              target_id="${PRIMARY_IDS[$tgt]}"
+              src_host="${PRIMARY_HOSTS[$src]}"; src_port="${PRIMARY_PORTS[$src]}"
+              slot_range="${start}-${end}"
+
+              info "Migration ${mig_idx}: slots ${slot_range} from ${src_host}:${src_port} to ${target_id:0:8}..."
+              mig_result="$(vcli "$src_host" "$src_port" CLUSTER MIGRATESLOTS SLOTSRANGE "$start" "$end" NODE "$target_id" 2>&1)"
+              if [[ "$mig_result" != *"OK"* ]]; then
+                fail "CLUSTER MIGRATESLOTS failed: ${mig_result}"
+                MIGRATION_FAILED=true; break
+              fi
+
+              info "  Migration started (async). Polling for slot_range=${slot_range}..."
+              elapsed=0; migration_done=false
+              while [[ $elapsed -lt $ASM_TIMEOUT ]]; do
+                sleep "$POLL_INTERVAL"; elapsed=$((elapsed + POLL_INTERVAL))
+                src_status_raw="$(vcli "$src_host" "$src_port" CLUSTER GETSLOTMIGRATIONS 2>&1 || echo 'UNREACHABLE')"
+                tgt_host="${PRIMARY_HOSTS[$tgt]}"; tgt_port="${PRIMARY_PORTS[$tgt]}"
+                tgt_status_raw="$(vcli "$tgt_host" "$tgt_port" CLUSTER GETSLOTMIGRATIONS 2>&1 || echo 'UNREACHABLE')"
+
+                # Check state of OUR migration only (by slot range), ignore stale history
+                src_state="$(get_mig_state "$src_status_raw" "$slot_range")"
+                tgt_state="$(get_mig_state "$tgt_status_raw" "$slot_range")"
+
+                if [[ "$src_state" == "failed" || "$src_state" == "cancelled" ]]; then
+                  fail "  Migration failed on source (state=${src_state})"
+                  MIGRATION_FAILED=true; break 2
+                fi
+                if [[ "$tgt_state" == "failed" || "$tgt_state" == "cancelled" ]]; then
+                  fail "  Migration failed on target (state=${tgt_state})"
+                  MIGRATION_FAILED=true; break 2
+                fi
+                if [[ "$src_state" == "success" && "$tgt_state" == "success" ]]; then
+                  migration_done=true; break
+                fi
+                # Also succeed if source says success (target may not track it the same way)
+                if [[ "$src_state" == "success" ]]; then
+                  migration_done=true; break
+                fi
+                [[ $((elapsed % 10)) -eq 0 ]] && info "  Polling... src=${src_state:-pending} tgt=${tgt_state:-pending} (${elapsed}s)"
+              done
+              [[ "$MIGRATION_FAILED" == "true" ]] && break
+              if [[ "$migration_done" != "true" ]]; then
+                fail "  Migration timed out after ${ASM_TIMEOUT}s"; MIGRATION_FAILED=true; break
+              fi
+              info "  Migration ${mig_idx} completed (${elapsed}s)"
+            done
+
+            # ── Step 7: Error handling ─────────────────────────────────────
+            if [[ "$MIGRATION_FAILED" == "true" ]]; then
+              cancel_all_migrations
+              sleep 2
+              REMNANTS="$(vcli_local CLUSTER NODES 2>/dev/null || echo '')"
+              if echo "$REMNANTS" | grep -qE '\[.*->-\]|\[.*-<-\]'; then
+                warn "MIGRATING/IMPORTING remnants detected after cancellation."
+                run_cluster_fix
+              fi
+              fail "ASM resharding FAILED. Cluster may need manual inspection."
+              exit 1
+            fi
+
+            # ── Step 8: Verify ─────────────────────────────────────────────
+            info "All migrations completed. Verifying cluster health..."
+            sleep 2
+            CLUSTER_INFO="$(vcli_local CLUSTER INFO 2>/dev/null)"
+            SLOTS_OK="$(echo "$CLUSTER_INFO" | grep 'cluster_slots_ok' | cut -d: -f2 | tr -d '[:space:]')"
+            CLUSTER_STATE="$(echo "$CLUSTER_INFO" | grep 'cluster_state' | cut -d: -f2 | tr -d '[:space:]')"
+            info "cluster_state=${CLUSTER_STATE} cluster_slots_ok=${SLOTS_OK}"
+
+            if [[ "$SLOTS_OK" != "16384" ]]; then
+              fail "VERIFICATION FAILED: cluster_slots_ok=${SLOTS_OK} (expected 16384)"
+              run_cluster_fix
+              sleep 2
+              CLUSTER_INFO="$(vcli_local CLUSTER INFO 2>/dev/null)"
+              SLOTS_OK="$(echo "$CLUSTER_INFO" | grep 'cluster_slots_ok' | cut -d: -f2 | tr -d '[:space:]')"
+              if [[ "$SLOTS_OK" != "16384" ]]; then
+                fail "cluster_slots_ok still ${SLOTS_OK} after fix. Manual intervention required."
+                exit 1
+              fi
+              info "Cluster fix restored all slots."
+            fi
+            if [[ "$CLUSTER_STATE" != "ok" ]]; then
+              fail "VERIFICATION FAILED: cluster_state=${CLUSTER_STATE} (expected ok)"
+              exit 1
+            fi
+
+            # ── Step 9: Clean up stale replica importing flags ────────────
+            # Valkey 9 bug (valkey-io/valkey#998): when a replica does a full sync
+            # during slot migration, the RDB snapshot carries the in-progress
+            # importing state. After the primary completes the migration and clears
+            # its importing flag, the replica still has the stale flag from the RDB.
+            # Gossip won't clear it (cleanup is primary-only). SETSLOT STABLE is
+            # rejected on replicas from external clients.
+            #
+            # Fix: run CLUSTER SETSLOT <slot> STABLE on the PRIMARY of the affected
+            # replica. The primary propagates it to the replica via the replication
+            # stream (forceCommandPropagation). This clears the stale flag.
+            info "Checking for stale importing/migrating flags on all nodes..."
+            ALL_NODES_CHECK="$(vcli_local CLUSTER NODES 2>/dev/null || echo '')"
+            STALE_FIXED=0
+            STALE_FAILED=0
+            while IFS= read -r line; do
+              [[ -z "$line" ]] && continue
+              node_flags="$(echo "$line" | awk '{print $3}')"
+              if echo "$node_flags" | grep -q "fail\|handshake"; then continue; fi
+              slot_fields="$(echo "$line" | awk '{for(i=9;i<=NF;i++) printf "%s ", $i}')"
+              # Extract slot numbers from [slot-<-nodeid] or [slot->-nodeid] markers
+              stale_slots="$(echo "$slot_fields" | grep -oE '\[[0-9]+-[<>]-' | grep -oE '[0-9]+' || true)"
+              if [[ -z "$stale_slots" ]]; then continue; fi
+
+              node_id="$(echo "$line" | awk '{print $1}')"
+              node_fqdn="$(echo "$line" | awk '{print $2}' | cut -d@ -f2 | cut -d, -f2 | cut -d. -f1)"
+
+              if echo "$node_flags" | grep -q "slave"; then
+                # Replica: find its primary and issue SETSLOT STABLE there
+                primary_id="$(echo "$line" | awk '{print $4}')"
+                primary_line="$(echo "$ALL_NODES_CHECK" | grep "^${primary_id} ")"
+                if [[ -z "$primary_line" ]]; then
+                  warn "Cannot find primary ${primary_id:0:8}... for replica ${node_fqdn}. Manual fix needed."
+                  STALE_FAILED=$((STALE_FAILED + 1))
+                  continue
+                fi
+                primary_addr="$(echo "$primary_line" | awk '{print $2}' | cut -d@ -f1)"
+                primary_host="$(echo "$primary_addr" | rev | cut -d: -f2- | rev)"
+                primary_port="$(echo "$primary_addr" | rev | cut -d: -f1 | rev)"
+                for slot in $stale_slots; do
+                  info "  Clearing stale slot ${slot} on replica ${node_fqdn} via primary ${primary_host}:${primary_port}..."
+                  result="$(vcli "$primary_host" "$primary_port" CLUSTER SETSLOT "$slot" STABLE 2>&1 || echo 'ERROR')"
+                  if [[ "$result" == *"OK"* ]]; then
+                    STALE_FIXED=$((STALE_FIXED + 1))
+                  else
+                    warn "  Failed to clear slot ${slot}: ${result}"
+                    STALE_FAILED=$((STALE_FAILED + 1))
+                  fi
+                done
+              else
+                # Primary: issue SETSLOT STABLE directly
+                node_addr="$(echo "$line" | awk '{print $2}' | cut -d@ -f1)"
+                node_host="$(echo "$node_addr" | rev | cut -d: -f2- | rev)"
+                node_port="$(echo "$node_addr" | rev | cut -d: -f1 | rev)"
+                for slot in $stale_slots; do
+                  info "  Clearing stale slot ${slot} on primary ${node_fqdn}..."
+                  result="$(vcli "$node_host" "$node_port" CLUSTER SETSLOT "$slot" STABLE 2>&1 || echo 'ERROR')"
+                  if [[ "$result" == *"OK"* ]]; then
+                    STALE_FIXED=$((STALE_FIXED + 1))
+                  else
+                    warn "  Failed to clear slot ${slot}: ${result}"
+                    STALE_FAILED=$((STALE_FAILED + 1))
+                  fi
+                done
+              fi
+            done <<< "$ALL_NODES_CHECK"
+
+            if [[ $STALE_FIXED -gt 0 ]]; then
+              info "Cleared ${STALE_FIXED} stale slot flag(s) (valkey-io/valkey#998 workaround)."
+              sleep 2  # let replication propagate SETSLOT STABLE to replicas
+            fi
+            if [[ $STALE_FAILED -gt 0 ]]; then
+              warn "${STALE_FAILED} stale flag(s) could not be cleared. These may block KubeBlocks preTerminate."
+              warn "Manual fix: delete the affected replica pod (KubeBlocks will recreate it)."
+            fi
+            if [[ $STALE_FIXED -eq 0 && $STALE_FAILED -eq 0 ]]; then
+              info "No stale importing/migrating flags found."
+            fi
+
+            # Show final topology
+            info "Final topology:"
+            FINAL_NODES="$(vcli_local CLUSTER NODES)"
+            while IFS= read -r line; do
+              [[ -z "$line" ]] && continue
+              node_id="$(echo "$line" | awk '{print $1}')"
+              node_flags="$(echo "$line" | awk '{print $3}')"
+              if echo "$node_flags" | grep -q "master" && ! echo "$node_flags" | grep -q "fail\|handshake"; then
+                node_slots="$(echo "$line" | awk '{for(i=9;i<=NF;i++) printf "%s ", $i}')"
+                info "  ${node_id:0:8}... [${node_slots}]"
+              fi
+            done <<< "$FINAL_NODES"
+            info "ASM resharding completed successfully: ${CURRENT_SHARDS} -> ${TARGET_SHARDS} shards"
+            exit 0
+
+    # ── Action 3: scale-in topology change ───────────────────────────────
+    # No-op when current_shards <= target. Otherwise patches Cluster.spec.
+    # shardings[0].shards down (slots have already been drained by
+    # asm-migrate) and waits for KubeBlocks to delete the extra pods.
+    - name: finalize-topology
+      failurePolicy: Fail
+      parameters:
+        - targetShards
+        - clusterName
+      workload:
+        type: Job
+        podInfoExtractorName: valkey-pod
+        backoffLimit: 0
+        podSpec:
+          # KB ignores serviceAccountName here; it injects the component's
+          # kb-managed SA. The chart binds the asm-orchestrator Role to
+          # the namespace's SA group, which covers it. See chart's
+          # templates/asm-rbac.yaml for the rationale.
+          restartPolicy: Never
+          containers:
+            - name: kubectl
+              image: {{ .Values.image.registry | default "docker.io" }}/apecloud/kubectl:1.29
+              imagePullPolicy: IfNotPresent
+              command:
+                - bash
+                - -c
+                - |
+                  set -euo pipefail
+                  CLUSTER="${clusterName}"
+                  TARGET="${targetShards}"
+                  NS="${CLUSTER_NAMESPACE}"
+                  log() { echo "[finalize-topology] $(date +%H:%M:%S) $*"; }
+
+                  CURRENT=$(kubectl get cluster -n "$NS" "$CLUSTER" \
+                    -o jsonpath='{.spec.shardings[0].shards}')
+                  log "current_shards=${CURRENT} target_shards=${TARGET}"
+
+                  if [[ "$TARGET" -ge "$CURRENT" ]]; then
+                    log "Not scale-in; nothing to patch."
+                    exit 0
+                  fi
+
+                  log "Scale-in: patching Cluster ${CLUSTER} shardings[0].shards=${TARGET}"
+                  kubectl patch cluster -n "$NS" "$CLUSTER" --type=json \
+                    -p "[{\"op\":\"replace\",\"path\":\"/spec/shardings/0/shards\",\"value\":${TARGET}}]"
+
+                  REPLICAS=$(kubectl get cluster -n "$NS" "$CLUSTER" \
+                    -o jsonpath='{.spec.shardings[0].template.replicas}')
+                  EXPECTED=$((TARGET * REPLICAS))
+                  log "Waiting for pod count to drop to ${EXPECTED}..."
+
+                  elapsed=0
+                  while [[ $elapsed -lt 600 ]]; do
+                    COUNT=$(kubectl get pods -n "$NS" \
+                      -l "app.kubernetes.io/instance=${CLUSTER},apps.kubeblocks.io/sharding-name=shard" \
+                      --no-headers 2>/dev/null | wc -l | tr -d ' ')
+                    [[ "$COUNT" -le "$EXPECTED" ]] && break
+                    [[ $((elapsed % 30)) -eq 0 ]] && log "  count=${COUNT} target=${EXPECTED} (${elapsed}s)..."
+                    sleep 10
+                    elapsed=$((elapsed + 10))
+                  done
+                  if [[ "$COUNT" -gt "$EXPECTED" ]]; then
+                    log "ERROR: pod count still ${COUNT} > ${EXPECTED} after 10m"
+                    exit 1
+                  fi
+
+                  log "Waiting for Cluster phase Running..."
+                  elapsed=0
+                  while [[ $elapsed -lt 300 ]]; do
+                    PHASE=$(kubectl get cluster -n "$NS" "$CLUSTER" \
+                      -o jsonpath='{.status.phase}' 2>/dev/null)
+                    [[ "$PHASE" == "Running" ]] && break
+                    sleep 5
+                    elapsed=$((elapsed + 5))
+                  done
+                  log "Cluster phase=${PHASE}. Scale-in finalized."
+              env:
+                - name: clusterName
+                  value: $(clusterName)
+                - name: targetShards
+                  value: $(targetShards)
+                - name: CLUSTER_NAMESPACE
+                  value: $(CLUSTER_NAMESPACE)
