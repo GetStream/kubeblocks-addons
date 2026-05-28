@@ -760,6 +760,14 @@ parse_redis_cluster_shard_announce_addr() {
 }
 
 start_redis_server() {
+    # Cache-only invariant: with save="" and appendonly no, a dump.rdb on disk
+    # is always stale. Loading it on boot would serve back yesterday's state
+    # to clients (chat-api throughput would see incorrect cache hits). Wipe
+    # any RDB residue left by prior replication syncs before exec.
+    if [[ -f /data/dump.rdb ]]; then
+      echo "Removing stale /data/dump.rdb before startup (cache-only mode)"
+      rm -f /data/dump.rdb
+    fi
     module_path="/opt/redis-stack/lib"
     if [[ "$IS_REDIS8" == "true" ]]; then
        module_path="/usr/local/lib/redis/modules"

@@ -12,16 +12,16 @@ spec:
   shardsLimit:
     minShards: 1
     maxShards: 64
-  # NOTE: provisionStrategy + updateStrategy are declared/validated by KB 1.0.2
-  # (`controllers/apps/shardingdefinition_controller.go:validateProvisionNUpdateStrategy`)
-  # but NOT actually consumed when reconciling shard rollouts. The cluster
-  # controller updates all sharding components in parallel regardless of this
-  # value. Verified by `grep -r SerialStrategy pkg/controller/` returning no
-  # consumer references. Leaving as Parallel to match the field's actual
-  # semantics in this KB version — see charts/valkey/README.md for what
-  # actually controls upgrade safety (spoiler: nothing, currently).
+  # updateStrategy: Serial requires our forked KubeBlocks operator
+  # (feat/shard-update-strategy-serial), which rolls sharding components one at a
+  # time, waiting for each shard to become ready before the next. Stock KB 1.0.2
+  # validates this field but does not consume it (it updates all shards in
+  # parallel), so against the stock operator this value is inert and harmless.
+  # One-at-a-time keeps the rest of the cluster stable while a shard's primary
+  # switchover runs, which a parallel rollout cannot guarantee.
+  # provisionStrategy stays Parallel: new shards are created empty, no data risk.
   provisionStrategy: Parallel
-  updateStrategy: Parallel
+  updateStrategy: Serial
   systemAccounts:
     - name: default
       shared: true

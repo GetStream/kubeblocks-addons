@@ -24,7 +24,7 @@ replica-read-only yes
 repl-diskless-sync yes
 repl-diskless-sync-delay 5
 repl-diskless-sync-max-replicas 0
-repl-diskless-load disabled
+repl-diskless-load on-empty-db
 repl-disable-tcp-nodelay no
 replica-priority 100
 acllog-max-len 128
@@ -38,11 +38,12 @@ oom-score-adj no
 oom-score-adj-values 0 200 800
 disable-thp yes
 
-# AOF on: required for data preservation across image-swap restarts. Without
-# AOF, shutdown-save races with shutdown-timeout under concurrent writes, and
-# a flushed dump.rdb can wipe a shard via the "empty master returns" cluster
-# bus path. With AOF, every write is on disk within ~1s; restart replays AOF.
-appendonly yes
+# AOF off: cache-only experiment. nodes.conf on the (tiny) PVC preserves
+# cluster topology across pod restarts; data is intentionally ephemeral. With
+# BestEffortParallel updateStrategy, both replicas of a shard restart together
+# during ops, so the shard's data is lost — but the cluster reforms via
+# nodes.conf without operator intervention.
+appendonly no
 appendfilename "appendonly.aof"
 appenddirname "appendonlydir"
 appendfsync everysec

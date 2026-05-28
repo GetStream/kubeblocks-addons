@@ -104,10 +104,13 @@ get_all_shards_pod_fqdns() {
 shutdown_redis_server() {
   local service_port="$1"
   unset_xtrace_when_ut_mode_false
+  # NOSAVE: we run cache-only (AOF off, save ""); stale dump.rdb on disk would
+  # serve back wrong state to clients on next restart. Always shut down without
+  # writing an RDB. Bootstrap also wipes /data/dump.rdb before exec.
   if ! is_empty "$REDIS_DEFAULT_PASSWORD"; then
-    redis-cli $REDIS_CLI_TLS_CMD -h 127.0.0.1 -p "$service_port" -a "$REDIS_DEFAULT_PASSWORD" shutdown
+    redis-cli $REDIS_CLI_TLS_CMD -h 127.0.0.1 -p "$service_port" -a "$REDIS_DEFAULT_PASSWORD" shutdown nosave
   else
-    redis-cli $REDIS_CLI_TLS_CMD -h 127.0.0.1 -p "$service_port" shutdown
+    redis-cli $REDIS_CLI_TLS_CMD -h 127.0.0.1 -p "$service_port" shutdown nosave
   fi
   set_xtrace_when_ut_mode_false
   echo "shutdown redis server succeeded!"

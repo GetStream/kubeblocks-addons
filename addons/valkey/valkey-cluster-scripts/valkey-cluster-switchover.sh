@@ -222,8 +222,14 @@ switchover_without_candidate() {
     return 1
   fi
 
-  # do switchover
-  do_switchover "$candidate_pod" "$candidate_pod_fqdn" "false" || return 1
+  # do switchover, need_check=true: wait until the candidate is verified primary
+  # before returning. The operator blocks on this action and only deletes the old
+  # primary AFTER it returns, so the old primary stays alive to coordinate the
+  # non-forced CLUSTER FAILOVER handshake. Paired with Serial sharding updates,
+  # only one shard fails over at a time against an otherwise-stable cluster, so
+  # the failover gets clean master quorum and completes well within the verify
+  # window (no timeout, no empty-primary rejoin).
+  do_switchover "$candidate_pod" "$candidate_pod_fqdn" "true" || return 1
 }
 
 switchover_with_candidate() {
