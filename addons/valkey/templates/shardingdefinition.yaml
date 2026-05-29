@@ -12,15 +12,9 @@ spec:
   shardsLimit:
     minShards: 1
     maxShards: 64
-  # updateStrategy: Serial requires our forked KubeBlocks operator
-  # (feat/shard-update-strategy-serial), which rolls sharding components one at a
-  # time, waiting for each shard to become ready before the next. Stock KB 1.0.2
-  # validates this field but does not consume it (it updates all shards in
-  # parallel), so against the stock operator this value is inert and harmless.
-  # One-at-a-time keeps the rest of the cluster stable while a shard's primary
-  # switchover runs, which a parallel rollout cannot guarantee.
-  # provisionStrategy stays Parallel: new shards are created empty, no data risk.
   provisionStrategy: Parallel
+  # Roll one shard at a time on update. Requires the GetStream operator fork;
+  # stock KubeBlocks 1.0.2 validates this field but ignores it.
   updateStrategy: Serial
   systemAccounts:
     - name: default

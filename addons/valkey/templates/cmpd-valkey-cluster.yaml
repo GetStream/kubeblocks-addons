@@ -49,14 +49,8 @@ spec:
             targetPort: cluster-bus
       podService: true
       disableAutoProvision: true
-  # Serial: update one replica at a time, waiting for each to be Ready before
-  # the next. For a shard (1 primary + 1 secondary) this keeps one replica up
-  # holding the keyspace while the other recreates and re-syncs — the property
-  # that preserves data across day-2 ops WITHOUT AOF. BestEffortParallel
-  # degenerates to full-parallel here: both roles set participatesInQuorum:
-  # false, so KubeBlocks finds no quorum to protect and updates both pods of a
-  # shard at once, flushing it on cache-only clusters. Serial is also
-  # KubeBlocks' own default (factory/builder.go getMemberUpdateStrategy).
+  # Roll one replica per shard at a time; the surviving replica serves while
+  # the other recreates.
   updateStrategy: Serial
   podManagementPolicy: OrderedReady
   volumes:
@@ -106,15 +100,12 @@ spec:
       defaultMode: 0555
   {{- include "kblib.syncer.policyRules" $ | nindent 2 }}
   systemAccounts:
-    # No passwordGenerationPolicy on purpose: do NOT let KubeBlocks mint a
-    # requirepass for the default account. With auth.blankPassword the Cluster
-    # supplies an empty secretRef (blank-auth) and the account stays password-less.
-    # Generation was the latent bug: KB wrote a 10-char password into the
-    # Component-owned `<comp>-account-default` secret, so any pod recreated after
-    # that point booted with requirepass while long-lived pods stayed blank,
-    # i.e. split auth, replica master_link_status:down, Lever A holds it not-ready.
     - name: default
       initAccount: true
+      passwordGenerationPolicy:
+        length: 16
+        numDigits: 4
+        letterCase: MixedCases
   hostNetwork:
     containerPorts:
       - container: valkey-cluster
@@ -468,16 +459,9 @@ spec:
       retryPolicy:
         maxRetries: 10
     switchover:
-      # Budget for the switchover's `cluster failover` (valkey-cluster-switchover.sh),
-      # which waits for the candidate replica's replication offset to match the
-      # primary before promoting — it will NOT promote a behind replica. Under
-      # Serial updates a recreated replica must full-sync first; on large
-      # replicas (tens of GB) that sync + failover handshake can take minutes.
-      # If it exceeds this budget, kbagent logs "failed to call switchover
-      # action, ignore it" and terminates the primary anyway → shard flush.
-      # Default is the kbagent ~30s timeout (far too short). 360s gives headroom
-      # for large-dataset syncs; raise further or pre-warm replicas if a real
-      # 30GB+ sync approaches it.
+      # Switchover action timeout. Must cover the candidate replica's
+      # full-sync + CLUSTER FAILOVER handshake; on timeout the operator
+      # drops the primary anyway. Raise for large keyspaces.
       timeoutSeconds: 360
       exec:
         container: valkey-cluster
@@ -564,7 +548,7 @@ spec:
               command:
                 - /bin/bash
                 - -c
-                - /scripts/valkey-cluster-replica-pre-stop.sh
+                - /scripts/valkey-cluster-pre-stop.sh
   {{- if $.Values.enableMetrics }}
       - name: metrics
         imagePullPolicy: {{ $.Values.metrics.image.pullPolicy | quote }}

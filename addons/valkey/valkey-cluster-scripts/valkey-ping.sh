@@ -57,20 +57,8 @@ retry_check_redis_ok() {
   fi
 }
 
-# check_replica_synced gates readiness on replication state, not just PING.
-#
-# Why: the default PING check returns PONG the moment the server accepts
-# connections — which is DURING a replica's full sync, before it holds any
-# data. KubeBlocks' Serial rolling update waits on pod-Ready before moving to
-# the next pod (and before switchover promotes a replica), so a PING-only
-# readiness lets the update advance while a recreated replica is still empty.
-# With AOF off that flushes the shard when the role lands on the unsynced pod.
-#
-# Gate: a master (or a node whose role can't be read) is Ready on PING alone.
-# A replica is Ready only when master_link_status:up — its initial sync from
-# the primary has completed and it actually holds the dataset. This makes the
-# Serial update wait for full sync before switchover, closing the
-# readiness-before-sync window.
+# A master returns 0 on PING. A replica returns 0 only when
+# master_link_status:up (initial sync done); 1 otherwise.
 check_replica_synced() {
   unset_xtrace_when_ut_mode_false
   service_port=${SERVICE_PORT:-6379}

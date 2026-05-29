@@ -8,10 +8,19 @@ test || __() {
 }
 
 load_common_library() {
-  # the common.sh scripts is mounted to the same path which is defined in the cmpd.spec.scripts
-  common_library_file="/scripts/common.sh"
-  # shellcheck disable=SC1090
-  source "${common_library_file}"
+  # shellcheck disable=SC1091
+  source /scripts/common.sh
+  # shellcheck disable=SC1091
+  source /scripts/valkey-cluster-common.sh
+}
+
+# Hand primary role to a healthy secondary before exit.
+primary_handoff_before_stop() {
+  __SOURCED__=1
+  # shellcheck disable=SC1091
+  source /scripts/valkey-cluster-switchover.sh
+  init_redis_cluster_service_port
+  switchover_without_candidate
 }
 
 acl_save_before_stop() {
@@ -40,4 +49,10 @@ ${__SOURCED__:+false} : || return 0
 
 # main
 load_common_library
+
+role=$(check_redis_role localhost "$SERVICE_PORT")
+if [ "$role" = "primary" ]; then
+  primary_handoff_before_stop || echo "primary handoff failed; continuing with stop"
+fi
+
 acl_save_before_stop
