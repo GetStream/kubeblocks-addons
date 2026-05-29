@@ -1,0 +1,32 @@
+apiVersion: apps.kubeblocks.io/v1
+kind: ShardingDefinition
+metadata:
+  name: valkey-cluster
+  labels:
+    {{- include "valkey.labels" . | nindent 4 }}
+  annotations:
+    {{- include "valkey.apiVersion" . | nindent 4 }}
+spec:
+  template:
+    compDef: {{ include "valkeyCluster.cmpdRegexpPattern" . }}
+  shardsLimit:
+    minShards: 1
+    maxShards: 64
+  provisionStrategy: Parallel
+  # Roll one shard at a time on update. Requires the GetStream operator fork;
+  # stock KubeBlocks 1.0.2 validates this field but ignores it.
+  updateStrategy: Serial
+  systemAccounts:
+    - name: default
+      shared: true
+  lifecycleActions:
+    shardRemove:
+      timeoutSeconds: 900
+      exec:
+        container: valkey-cluster
+        command:
+          - /bin/bash
+          - -c
+          - /scripts/valkey-cluster-manage.sh --pre-terminate > /tmp/pre-terminate.log 2>&1
+      retryPolicy:
+        maxRetries: 10
