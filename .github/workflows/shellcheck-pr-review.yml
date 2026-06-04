@@ -47,8 +47,10 @@ jobs:
 
       - name: Get file path
         id: get_file_path
+        env:
+          BASE_COMMITID: ${{ env.BASE_COMMITID }}
         run: |
-          FILE_PATH=`git diff --name-only HEAD ${{ env.BASE_COMMITID }}`
+          FILE_PATH=`git diff --name-only HEAD "$BASE_COMMITID"`
           echo "FILE_PATH: $FILE_PATH"
           SHELL_FILE_PATH=""
           for filePath in $(echo "$FILE_PATH"); do
