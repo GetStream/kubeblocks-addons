@@ -34,13 +34,13 @@ jobs:
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          HEAD_REF="${{ env.HEAD_REF }}"
+          HEAD_REF="$HEAD_REF"
           if [[ "${HEAD_REF}" != "main" ]]; then
               git checkout -b ${HEAD_REF} --track origin/${HEAD_REF}
           fi
           BASE_COMMITID=`bash .github/utils/utils.sh --type 1 \
               --branch-name "${HEAD_REF}" \
-              --base-branch "${{ env.BASE_BRANCH }}"`
+              --base-branch "$BASE_BRANCH"`
 
           echo "BASE_COMMITID:$BASE_COMMITID"
           echo BASE_COMMITID=$BASE_COMMITID >> $GITHUB_ENV
