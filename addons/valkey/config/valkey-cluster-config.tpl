@@ -105,7 +105,10 @@ cluster-config-file /data/nodes.conf
 cluster-allow-replica-migration no
 cluster-node-timeout 5000
 cluster-replica-validity-factor 0
-cluster-require-full-coverage yes
+# Cache mode: keep serving covered slots when one shard is briefly uncovered
+# (e.g. during a crashed-primary failover hold), instead of freezing the whole
+# cluster. A lost shard degrades to errors on its own slots only.
+cluster-require-full-coverage no
 cluster-allow-reads-when-down no
 
 # Eviction policy: allkeys-lru (cache mode — we want eviction across the

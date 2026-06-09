@@ -376,6 +376,64 @@ is_rejoining_pod() {
   return 0
 }
 
+# hold_if_crashed_empty_primary blocks startup when this pod is an ex-primary
+# that crashed and lost its data, until its in-sync replica has been promoted.
+# Persistence is off, so the keyspace is always empty on boot; if nodes.conf
+# still records us as a master owning slots, we crashed. Starting before the
+# replica is promoted would make it resync from our empty dataset and discard
+# the only surviving copy. We poll our shard peers and start as soon as one is
+# promoted (then rejoin as its replica and resync), capped so a stuck failover
+# cannot hang the pod forever.
+hold_if_crashed_empty_primary() {
+  [[ ! -f /data/nodes.conf ]] && return 0
+  local myself
+  myself=$(grep 'myself' /data/nodes.conf 2>/dev/null || true)
+  [[ -z "$myself" ]] && return 0
+  # only an ex-primary that still owns slots: "master" flag plus slot tokens
+  # (a digit or "[") after the "connected" link-state field.
+  echo "$myself" | grep -q 'master' || return 0
+  echo "$myself" | grep -qE 'connected[[:space:]]+[0-9[]' || return 0
+
+  local timeout_ms cap_seconds waited interval pod_name pod_fqdn role promoted
+  # cluster-node-timeout lives in the rendered template conf (/etc/conf), not
+  # the real conf at /etc/redis; fall back to the redis default if absent.
+  timeout_ms=$(awk '/^cluster-node-timeout/{print $2; exit}' "$redis_template_conf" 2>/dev/null || true)
+  [[ "$timeout_ms" =~ ^[0-9]+$ ]] || timeout_ms=15000
+  # Cap covers FAIL detection plus one failover election retry (~node-timeout*4),
+  # with a 60s floor for slow gossip/voting. The common case exits in seconds.
+  cap_seconds=$(( timeout_ms * 8 / 1000 ))
+  [[ "$cap_seconds" -lt 60 ]] && cap_seconds=60
+  interval=2
+  waited=0
+  promoted="false"
+  echo "Crashed empty ex-primary detected; waiting up to ${cap_seconds}s for a shard peer to be promoted before rejoining (avoids empty-resync data loss)."
+  while [[ "$waited" -lt "$cap_seconds" ]]; do
+    # A shard's pods only ever master that shard's slots, so a peer in this
+    # shard reporting primary means our failover has completed.
+    for pod_name in $(echo "$CURRENT_SHARD_POD_NAME_LIST" | tr ',' '\n'); do
+      [[ "$pod_name" == "$CURRENT_POD_NAME" ]] && continue
+      pod_fqdn=$(get_target_pod_fqdn_from_pod_fqdn_vars "$CURRENT_SHARD_POD_FQDN_LIST" "$pod_name") || continue
+      role=$(check_redis_role "$pod_fqdn" "$service_port")
+      if [[ "$role" == "primary" ]]; then
+        echo "Shard peer ${pod_name} is now primary (failover complete) after ${waited}s; rejoining as its replica."
+        promoted="true"
+        break
+      fi
+    done
+    [[ "$promoted" == "true" ]] && break
+    sleep "$interval"
+    waited=$(( waited + interval ))
+  done
+
+  if [[ "$promoted" != "true" ]]; then
+    # No shard peer was promoted within the cap: failover is stuck (quorum loss
+    # or peers unreachable) or this shard's replica is also gone (double loss).
+    # The data is likely already lost; start anyway (a cold cache beats a shard
+    # that stays down) so the keyspace-collapse alert fires on the symptom.
+    echo "WARNING: no shard peer promoted within ${cap_seconds}s; starting empty ex-primary WITHOUT confirmed failover (data-loss risk)." >&2
+  fi
+}
+
 # scale out replica of redis cluster shard if needed
 scale_redis_cluster_replica() {
   # Waiting for redis-server to start
@@ -820,6 +878,7 @@ init_environment
 load_redis_cluster_common_utils
 parse_redis_cluster_shard_announce_addr
 build_redis_conf
+hold_if_crashed_empty_primary
 # TODO: move to memberJoin action in the future
 scale_redis_cluster_replica &
 start_redis_server
